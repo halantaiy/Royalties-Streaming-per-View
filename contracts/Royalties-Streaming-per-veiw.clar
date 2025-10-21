@@ -17,6 +17,10 @@
 (define-constant err-invalid-percentage (err u107))
 (define-constant err-movie-not-found (err u108))
 (define-constant err-price-locked (err u109))
+(define-constant err-subscription-expired (err u110))
+(define-constant err-subscription-active (err u111))
+(define-constant err-invalid-tier (err u112))
+(define-constant err-no-subscription (err u113))
 
 (define-constant surge-threshold u10)
 (define-constant surge-multiplier u150)
@@ -76,6 +80,33 @@
     old-price: uint,
     new-price: uint,
     reason: (string-ascii 20)
+})
+
+(define-map subscriptions principal {
+    tier: uint,
+    expires-at: uint,
+    total-views: uint,
+    started-at: uint,
+    auto-renew: bool
+})
+
+(define-map subscription-tiers uint {
+    name: (string-ascii 20),
+    price: uint,
+    duration-blocks: uint,
+    active: bool
+})
+
+(define-map subscription-views {subscriber: principal, view-id: uint} {
+    movie-id: uint,
+    timestamp: uint,
+    watch-duration: uint
+})
+
+(define-map movie-subscription-stats uint {
+    total-subscription-views: uint,
+    total-watch-time: uint,
+    subscriber-count: uint
 })
 
 (define-public (mint-movie (title (string-ascii 100)) (price-per-view uint) (to principal))
@@ -267,6 +298,8 @@
 )
 
 (define-data-var contributor-id-nonce uint u1)
+(define-data-var subscription-pool uint u0)
+(define-data-var total-subscription-views uint u0)
 
 (define-private (get-next-contributor-id)
     (let
@@ -443,5 +476,188 @@
                                         u0)
         })
         (err err-movie-not-found)
+    )
+)
+
+(define-public (create-subscription-tier (tier-id uint) (name (string-ascii 20)) (price uint) (duration-blocks uint))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (asserts! (> price u0) err-invalid-percentage)
+        (asserts! (> duration-blocks u0) err-invalid-percentage)
+        (map-set subscription-tiers tier-id {
+            name: name,
+            price: price,
+            duration-blocks: duration-blocks,
+            active: true
+        })
+        (ok tier-id)
+    )
+)
+
+(define-public (purchase-subscription (tier-id uint))
+    (let
+        (
+            (tier (unwrap! (map-get? subscription-tiers tier-id) err-invalid-tier))
+            (existing-sub (map-get? subscriptions tx-sender))
+            (current-block stacks-block-height)
+        )
+        (asserts! (get active tier) err-invalid-tier)
+        (asserts! (is-none existing-sub) err-subscription-active)
+        (try! (stx-transfer? (get price tier) tx-sender contract-owner))
+        (map-set subscriptions tx-sender {
+            tier: tier-id,
+            expires-at: (+ current-block (get duration-blocks tier)),
+            total-views: u0,
+            started-at: current-block,
+            auto-renew: false
+        })
+        (var-set subscription-pool (+ (var-get subscription-pool) (get price tier)))
+        (ok true)
+    )
+)
+
+(define-public (renew-subscription)
+    (let
+        (
+            (sub (unwrap! (map-get? subscriptions tx-sender) err-no-subscription))
+            (tier (unwrap! (map-get? subscription-tiers (get tier sub)) err-invalid-tier))
+            (current-block stacks-block-height)
+        )
+        (asserts! (get active tier) err-invalid-tier)
+        (asserts! (< current-block (get expires-at sub)) err-subscription-expired)
+        (try! (stx-transfer? (get price tier) tx-sender contract-owner))
+        (map-set subscriptions tx-sender
+            (merge sub {
+                expires-at: (+ (get expires-at sub) (get duration-blocks tier))
+            })
+        )
+        (var-set subscription-pool (+ (var-get subscription-pool) (get price tier)))
+        (ok true)
+    )
+)
+
+(define-public (stream-with-subscription (movie-id uint) (watch-duration uint))
+    (let
+        (
+            (movie (unwrap! (map-get? movies movie-id) err-movie-not-found))
+            (sub (unwrap! (map-get? subscriptions tx-sender) err-no-subscription))
+            (current-block stacks-block-height)
+            (movie-stats (default-to {
+                total-subscription-views: u0,
+                total-watch-time: u0,
+                subscriber-count: u0
+            } (map-get? movie-subscription-stats movie-id)))
+            (view-id (+ (var-get total-subscription-views) u1))
+        )
+        (asserts! (< current-block (get expires-at sub)) err-subscription-expired)
+        (map-set subscription-views {subscriber: tx-sender, view-id: view-id} {
+            movie-id: movie-id,
+            timestamp: current-block,
+            watch-duration: watch-duration
+        })
+        (map-set subscriptions tx-sender
+            (merge sub {
+                total-views: (+ (get total-views sub) u1)
+            })
+        )
+        (map-set movie-subscription-stats movie-id
+            (merge movie-stats {
+                total-subscription-views: (+ (get total-subscription-views movie-stats) u1),
+                total-watch-time: (+ (get total-watch-time movie-stats) watch-duration)
+            })
+        )
+        (var-set total-subscription-views view-id)
+        (ok view-id)
+    )
+)
+
+(define-public (distribute-subscription-revenue (movie-id uint))
+    (let
+        (
+            (movie (unwrap! (map-get? movies movie-id) err-movie-not-found))
+            (movie-stats (unwrap! (map-get? movie-subscription-stats movie-id) err-movie-not-found))
+            (total-watch-time (get total-watch-time movie-stats))
+            (pool-balance (var-get subscription-pool))
+        )
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (asserts! (> total-watch-time u0) err-insufficient-balance)
+        (asserts! (> pool-balance u0) err-insufficient-balance)
+        (let
+            (
+                (platform-cut (/ (* pool-balance (var-get platform-fee)) u10000))
+                (remaining-amount (- pool-balance platform-cut))
+                (movie-share (/ (* remaining-amount total-watch-time) (var-get total-subscription-views)))
+            )
+            (try! (distribute-royalties movie-id movie-share))
+            (var-set subscription-pool (- pool-balance movie-share))
+            (ok movie-share)
+        )
+    )
+)
+
+(define-public (cancel-subscription)
+    (let
+        (
+            (sub (unwrap! (map-get? subscriptions tx-sender) err-no-subscription))
+        )
+        (map-delete subscriptions tx-sender)
+        (ok true)
+    )
+)
+
+(define-public (toggle-auto-renew)
+    (let
+        (
+            (sub (unwrap! (map-get? subscriptions tx-sender) err-no-subscription))
+        )
+        (map-set subscriptions tx-sender
+            (merge sub {
+                auto-renew: (not (get auto-renew sub))
+            })
+        )
+        (ok true)
+    )
+)
+
+(define-read-only (get-subscription (subscriber principal))
+    (map-get? subscriptions subscriber)
+)
+
+(define-read-only (is-subscription-active (subscriber principal))
+    (match (map-get? subscriptions subscriber)
+        sub (ok (< stacks-block-height (get expires-at sub)))
+        (ok false)
+    )
+)
+
+(define-read-only (get-subscription-tier (tier-id uint))
+    (map-get? subscription-tiers tier-id)
+)
+
+(define-read-only (get-movie-subscription-stats (movie-id uint))
+    (map-get? movie-subscription-stats movie-id)
+)
+
+(define-read-only (get-subscription-pool-balance)
+    (ok (var-get subscription-pool))
+)
+
+(define-read-only (get-subscription-view (subscriber principal) (view-id uint))
+    (map-get? subscription-views {subscriber: subscriber, view-id: view-id})
+)
+
+(define-read-only (get-subscription-status (subscriber principal))
+    (match (map-get? subscriptions subscriber)
+        sub (ok {
+            active: (< stacks-block-height (get expires-at sub)),
+            tier: (get tier sub),
+            expires-at: (get expires-at sub),
+            blocks-remaining: (if (< stacks-block-height (get expires-at sub))
+                                (- (get expires-at sub) stacks-block-height)
+                                u0),
+            total-views: (get total-views sub),
+            auto-renew: (get auto-renew sub)
+        })
+        (err err-no-subscription)
     )
 )
